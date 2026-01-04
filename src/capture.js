@@ -3,11 +3,77 @@ import fs from "fs";
 import path from "path";
 import { chromium } from "playwright";
 
-const url = process.argv[2];
-if (!url) {
-  console.error("Usage: node capture.js <URL>");
+const args = process.argv.slice(2);
+let hideFixed = false;
+let inputUrl;
+let delayMs = 400;
+let overlap = 0.1; // overlap ratio of viewport (0-<1)
+let maxShots = 500;
+
+for (let i = 0; i < args.length; i++) {
+  const arg = args[i];
+  if (arg === "--hide-fixed") {
+    hideFixed = true;
+  } else if (arg === "--delay") {
+    delayMs = Number(args[i + 1]);
+    i++;
+  } else if (arg === "--overlap") {
+    overlap = Number(args[i + 1]);
+    i++;
+  } else if (arg === "--max-shots") {
+    maxShots = Number(args[i + 1]);
+    i++;
+  } else if (!inputUrl) {
+    inputUrl = arg;
+  } else {
+    console.error(`Unknown argument: ${arg}`);
+    process.exit(1);
+  }
+}
+
+// fallback: accept URL from env var (helps on Windows cmd with &)
+if (!inputUrl) inputUrl = process.env.CAPTURE_URL || process.env.URL;
+
+if (!inputUrl) {
+  console.error("Usage: npm run capture -- [--hide-fixed] [--delay ms] [--overlap ratio] [--max-shots n] <URL>");
+  console.error("   or: node src/capture.js [--hide-fixed] [--delay ms] [--overlap ratio] [--max-shots n] <URL>");
+  console.error("   or: set CAPTURE_URL=<URL> && npm run capture --");
   process.exit(1);
 }
+
+if (!Number.isFinite(delayMs) || delayMs < 0) {
+  console.error("Invalid --delay (ms must be >= 0)");
+  process.exit(1);
+}
+
+if (!Number.isFinite(overlap) || overlap < 0 || overlap >= 1) {
+  console.error("Invalid --overlap (ratio must be 0 <= x < 1, e.g. 0.1 for 10%)");
+  process.exit(1);
+}
+
+if (!Number.isInteger(maxShots) || maxShots <= 0) {
+  console.error("Invalid --max-shots (must be a positive integer)");
+  process.exit(1);
+}
+
+// URLを検証し、スキーム省略時は https:// を補完する
+const normalizeUrl = (raw) => {
+  try {
+    new URL(raw);
+    return raw;
+  } catch {
+    try {
+      const prefixed = `https://${raw}`;
+      new URL(prefixed);
+      return prefixed;
+    } catch {
+      console.error(`Invalid URL: ${raw}`);
+      process.exit(1);
+    }
+  }
+};
+
+const url = normalizeUrl(inputUrl);
 
 const outDir = path.resolve("shots");
 fs.mkdirSync(outDir, { recursive: true });
@@ -23,16 +89,28 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
   await page.goto(url, { waitUntil: "networkidle" });
 
-  // 固定ヘッダが毎回写り込む場合は、必要に応じて非表示（サイトにより調整）
-  await page.addStyleTag({
-    content: `
-      /* 例: ありがちな固定要素を消す（必要なければ削除） */
-      header, [style*="position:fixed"], [style*="position: sticky"] { }
-    `,
-  });
+  if (hideFixed) {
+    await page.addStyleTag({
+      content: `
+        /* Hide common fixed/sticky bars while capturing */
+        [style*="position:fixed"],
+        [style*="position: fixed"],
+        [style*="position:sticky"],
+        [style*="position: sticky"],
+        [class*="sticky"],
+        [class*="fixed"],
+        header,
+        nav {
+          visibility: hidden !important;
+          pointer-events: none !important;
+        }
+      `,
+    });
+  }
 
   // ページの高さ・ビューポート高さ
   const viewportH = page.viewportSize().height;
+  const scrollStep = Math.max(1, Math.floor(viewportH * (1 - overlap)));
 
   // 無限スクロールも想定して「高さが伸びなくなるまで」ループ
   let lastHeight = 0;
@@ -40,22 +118,18 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
   let i = 0;
   while (true) {
-    const doc = await page.evaluate(() => ({
-      scrollY: window.scrollY,
-      innerH: window.innerHeight,
-      scrollH: document.documentElement.scrollHeight,
-    }));
-
     // 可視領域を撮影
     const filename = path.join(outDir, String(i).padStart(4, "0") + ".png");
     await page.screenshot({ path: filename });
     i++;
 
-    // 下へスクロール（重複を減らすなら 0.9倍など）
-    await page.evaluate((dy) => window.scrollBy(0, dy), Math.floor(viewportH * 0.9));
+    if (i >= maxShots) break;
+
+    // 下へスクロール（重複率 overlap を適用）
+    await page.evaluate((dy) => window.scrollBy(0, dy), scrollStep);
 
     // lazy load待ち
-    await sleep(400);
+    await sleep(delayMs);
 
     // 高さが伸びているかチェック（無限スクロール対策）
     const newHeight = await page.evaluate(() => document.documentElement.scrollHeight);
@@ -72,9 +146,6 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
     });
 
     if (atBottom && stableCount >= 3) break;
-
-    // 保険：無限ループ防止
-    if (i > 500) break;
   }
 
   await browser.close();
